@@ -1,0 +1,8 @@
+flask
+flask-cors
+transformers
+torch
+tensorflow           
+requests
+beautifulsoup4
+lxml
