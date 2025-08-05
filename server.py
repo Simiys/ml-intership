@@ -6,12 +6,11 @@ import re
 import time
 from flask_cors import CORS
 import os
+import ssl
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app) 
 
-# Загружаем модель и токенизатор при старте приложения
-print("Загружаем NER модель...")
 try:
     model = AutoModelForTokenClassification.from_pretrained("./ner_model/checkpoint-125")
     tokenizer = AutoTokenizer.from_pretrained("./ner_model/checkpoint-125")
@@ -29,18 +28,16 @@ def extract_possible_titles(url):
 
         if response.status_code != 200:
             print(f"[SKIP] {url}: Status code {response.status_code}")
-            return []
+            return [], True
 
         soup = BeautifulSoup(response.content, "lxml")
         candidates = []
 
-        # Извлекаем h1 заголовки
         for tag in soup.find_all(['h1']):
             text = tag.get_text(strip=True)
             if text:
                 candidates.append(text)
 
-        # Извлекаем элементы с классами, содержащими "name", "title"
         for tag in soup.find_all(['p', 'div', 'span']):
             cls = tag.get("class")
             if cls and any(any(substr in c.lower() for substr in ["name", "title"]) for c in (cls if isinstance(cls, list) else [cls])):
@@ -48,11 +45,26 @@ def extract_possible_titles(url):
                 if text:
                     candidates.append(text)
 
-        return candidates
+        return candidates, False
 
+    except requests.exceptions.SSLError as e:
+        print(f"[SSL ERROR] {url}: {e}")
+        return [], True
+    except requests.exceptions.ConnectionError as e:
+        print(f"[CONNECTION ERROR] {url}: {e}")
+        return [], True
+    except requests.exceptions.Timeout as e:
+        print(f"[TIMEOUT ERROR] {url}: {e}")
+        return [], True
+    except requests.exceptions.HTTPError as e:
+        print(f"[HTTP ERROR] {url}: {e}")
+        return [], True
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] {url}: {e}")
-        return []
+        print(f"[REQUEST ERROR] {url}: {e}")
+        return [], True
+    except Exception as e:
+        print(f"[GENERAL ERROR] {url}: {e}")
+        return [], True
 
 def process_with_ner(texts):
     """Обрабатывает список текстов через NER модель и возвращает результаты"""
@@ -66,22 +78,18 @@ def process_with_ner(texts):
             continue
             
         try:
-            # Получаем предсказания от модели
             entities = ner_pipeline(text)
             
-            # Ищем сущности с меткой PRODUCT
             for entity in entities:
                 if entity.get('entity_group') == 'PRODUCT' or entity.get('entity') == 'PRODUCT':
                     confidence = entity.get('score', 0)
-                    # Конвертируем в проценты и округляем
                     prob_percent = f"{int(confidence * 100)}%"
                     
-                    # Добавляем весь исходный текст, а не только найденную сущность
                     results.append({
                         "text": text,
                         "prob": prob_percent
                     })
-                    break  # Прерываем, так как уже нашли PRODUCT в этом тексте
+                    break  
                     
         except Exception as e:
             print(f"Ошибка обработки текста '{text}': {e}")
@@ -93,29 +101,52 @@ def process_with_ner(texts):
 def analyze_url():
     """Основная функция для обработки URL и извлечения названий мебели"""
     try:
-        # Получаем данные из запроса
         data = request.get_json()
         
         if not data or 'url' not in data:
-            return jsonify({"error": "URL не предоставлен"}), 400
+            return jsonify({
+                "error": True,
+                "results": [],
+                "products_identified": 0,
+                "total_titles_found": 0,
+                "message": "URL не предоставлен"
+            }), 400
         
         url = data['url']
         
-        # Валидация URL
         if not url.startswith(('http://', 'https://')):
-            return jsonify({"error": "Некорректный URL"}), 400
+            return jsonify({
+                "error": True,
+                "results": [],
+                "products_identified": 0,
+                "total_titles_found": 0,
+                "message": "Некорректный URL"
+            }), 400
         
         print(f"Обрабатываем URL: {url}")
         
-        # Извлекаем потенциальные названия
-        titles = extract_possible_titles(url)
+        titles, scraping_error = extract_possible_titles(url)
+        
+        if scraping_error:
+            return jsonify({
+                "error": True,
+                "results": [],
+                "products_identified": 0,
+                "total_titles_found": 0,
+                "message": "Ошибка при извлечении данных с сайта"
+            })
         
         if not titles:
-            return jsonify({"results": [], "message": "Не удалось извлечь названия с данной страницы"})
+            return jsonify({
+                "error": False,
+                "results": [],
+                "products_identified": 0,
+                "total_titles_found": 0,
+                "message": "Не удалось извлечь названия с данной страницы"
+            })
         
         print(f"Найдено {len(titles)} потенциальных названий")
         
-        # Удаляем дубликаты, сохраняя порядок
         unique_titles = []
         seen = set()
         for title in titles:
@@ -125,23 +156,28 @@ def analyze_url():
         
         print(f"После удаления дубликатов: {len(unique_titles)} названий")
         
-        # Обрабатываем через NER модель
         results = process_with_ner(unique_titles)
         
-        # Сортируем по вероятности (убираем % и конвертируем в int для сортировки)
         results.sort(key=lambda x: int(x['prob'].replace('%', '')), reverse=True)
         
         print(f"Найдено {len(results)} продуктов мебели")
         
         return jsonify({
+            "error": False,
             "results": results,
-            "total_titles_found": len(unique_titles),
-            "products_identified": len(results)
+            "products_identified": len(results),
+            "total_titles_found": len(unique_titles)
         })
         
     except Exception as e:
         print(f"Ошибка при обработке запроса: {e}")
-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+        return jsonify({
+            "error": True,
+            "results": [],
+            "products_identified": 0,
+            "total_titles_found": 0,
+            "message": "Внутренняя ошибка сервера"
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -164,7 +200,7 @@ def serve_react(path):
 if __name__ == '__main__':
     print("🚀 Запускаем Flask сервер...")
     print("📝 Доступные эндпоинты:")
-    print("  POST /analyze - анализ URL на наличие названий мебели")
+    print("  POST /api/analyze - анализ URL на наличие названий мебели")
     print("  GET /health - проверка состояния сервиса")
     
     app.run(debug=True, host='0.0.0.0', port=5000)
